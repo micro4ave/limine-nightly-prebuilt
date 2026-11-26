@@ -7,7 +7,6 @@ on:
       - main
   workflow_dispatch:
 
-# Prevent simultaneous builds from overwriting each other.
 concurrency:
   group: limine-build
   cancel-in-progress: false
@@ -33,45 +32,44 @@ jobs:
             autoconf \
             automake \
             patch \
-            git
+            git \
+            zip
 
       - name: Clone Limine source
         run: |
           git clone \
             --depth=1 \
-            --branch=v12.x \
+            --branch=trunk \
             https://github.com/Limine-Bootloader/Limine.git \
             limine-src
 
       - name: Build Limine
         run: |
           cd limine-src
-
           ./bootstrap
-
           ./configure \
             --enable-bios \
             --enable-uefi-x86-64 \
             --enable-uefi-ia32
-
           make -j"$(nproc)"
 
       - name: Prepare binaries
         run: |
           mkdir -p dist
-
           cp -a limine-src/bin/. dist/
 
-          # Record exactly which Limine commit was built.
           git -C limine-src rev-parse HEAD > dist/SOURCE_COMMIT
 
-          # Fail instead of publishing an incomplete build.
           test -f dist/limine
           test -f dist/limine-bios.sys
           test -f dist/BOOTX64.EFI
 
-          echo "Built files:"
           ls -lah dist/
+
+      - name: Create ZIP archive
+        run: |
+          cd dist
+          zip -r ../limine-binaries.zip .
 
       - name: Publish binaries branch
         run: |
@@ -93,3 +91,13 @@ jobs:
           git push origin binaries --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: limine-${{ github.sha }}
+          name: Limine build ${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          generate_release_notes: false
+          files: limine-binaries.zip
