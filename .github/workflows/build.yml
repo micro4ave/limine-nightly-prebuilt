@@ -2,10 +2,19 @@
 name: Build Limine
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'
+
   push:
     branches:
       - main
+
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if this Limine commit was already built'
+        type: boolean
+        default: false
 
 concurrency:
   group: limine-build
@@ -22,7 +31,38 @@ jobs:
       - name: Checkout build repository
         uses: actions/checkout@v4
 
+      - name: Check latest Limine commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ inputs.force }}
+        run: |
+          SHA=$(git ls-remote \
+            https://github.com/Limine-Bootloader/Limine.git \
+            refs/heads/trunk | cut -f1)
+
+          if [ -z "$SHA" ]; then
+            echo "Failed to retrieve Limine commit!"
+            exit 1
+          fi
+
+          echo "Latest Limine commit: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "Force rebuild requested!"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "limine-$SHA" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already built. Skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Limine commit detected!"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
+        if: steps.check.outputs.build == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -38,30 +78,43 @@ jobs:
             git \
             zip
 
-      - name: Clone Limine source
+      - name: Clone exact Limine commit
+        if: steps.check.outputs.build == 'true'
         run: |
-          git clone \
-            --depth=1 \
-            --branch=trunk \
+          git clone --no-checkout \
             https://github.com/Limine-Bootloader/Limine.git \
             limine-src
 
+          git -C limine-src fetch --depth=1 origin \
+            "${{ steps.check.outputs.sha }}"
+
+          git -C limine-src checkout --detach FETCH_HEAD
+
+          ACTUAL=$(git -C limine-src rev-parse HEAD)
+          test "$ACTUAL" = "${{ steps.check.outputs.sha }}"
+
       - name: Build Limine
+        if: steps.check.outputs.build == 'true'
         run: |
           cd limine-src
+
           ./bootstrap
+
           ./configure \
             --enable-bios \
             --enable-uefi-x86-64 \
             --enable-uefi-ia32
+
           make -j"$(nproc)"
 
       - name: Prepare binaries
+        if: steps.check.outputs.build == 'true'
         run: |
           mkdir -p dist
+
           cp -a limine-src/bin/. dist/
 
-          git -C limine-src rev-parse HEAD > dist/SOURCE_COMMIT
+          echo "${{ steps.check.outputs.sha }}" > dist/SOURCE_COMMIT
 
           test -f dist/limine
           test -f dist/limine-bios.sys
@@ -70,11 +123,15 @@ jobs:
           ls -lah dist/
 
       - name: Create ZIP archive
+        if: steps.check.outputs.build == 'true'
         run: |
           cd dist
           zip -r ../limine-binaries.zip .
 
       - name: Publish binaries branch
+        if: steps.check.outputs.build == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd dist
 
@@ -86,21 +143,29 @@ jobs:
             "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -A
-          git commit -m "Build Limine $(cat SOURCE_COMMIT)"
+          git commit -m "Build Limine ${{ steps.check.outputs.sha }}"
 
           git remote add origin \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-          git push origin binaries --force
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git push origin HEAD:binaries --force
 
       - name: Publish GitHub Release
+        if: steps.check.outputs.build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: limine-${{ github.sha }}
-          name: Limine build ${{ github.sha }}
+          tag_name: limine-${{ steps.check.outputs.sha }}
           target_commitish: ${{ github.sha }}
+          name: Limine build ${{ steps.check.outputs.sha }}
+          body: |
+            Automated Limine build.
+
+            Source repository: https://github.com/Limine-Bootloader/Limine
+            Source branch: trunk
+            Source commit: ${{ steps.check.outputs.sha }}
+
+            These binaries are UNTESTED and provided purely to stop needing to build the bootloader yourself.
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
+          fail_on_unmatched_files: true
           files: limine-binaries.zip
